@@ -726,25 +726,51 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                             // tmp was only written partially, note that len is in ZigZag order.
                             clobber_more_than_4x4 = len > 10;
 
-                            let idct_position = if PROGRESSIVE {
-                                // For non-interleaved, j indexes data units directly
-                                j * 8
+                            let (x_start, x_end, y_start, y_end) = if self.is_interleaved {
+                                let v_factor = self.v_max / component.vertical_sample;
+                                let h_factor = self.h_max / component.horizontal_sample;
+                                let block_h = v_factor * 8;
+                                let block_w = h_factor * 8;
+                                let y0 = mcu_row * self.mcu_height + v_samp * block_h;
+                                let x0 = j * self.mcu_width + h_samp * block_w;
+                                (x0, x0 + block_w, y0, y0 + block_h)
                             } else {
-                                // derived from stb and rewritten for my tastes
-                                let c2 = v_samp * 8;
-                                let c3 = ((j * component.horizontal_sample) + h_samp) * 8;
-
-                                component.width_stride * c2 + c3
+                                let y0 = mcu_row * 8;
+                                let x0 = j * 8;
+                                (x0, x0 + 8, y0, y0 + 8)
                             };
 
-                            let idct_pos = channel.get_mut(idct_position..).unwrap();
-                            if len <= 1 || self.downscale_factor >= 8 {
-                                (self.idct_1x1_func)(tmp, idct_pos, component.width_stride);
-                            } else if len <= 10 || self.downscale_factor >= 4 {
-                                (self.idct_4x4_func)(tmp, idct_pos, component.width_stride);
-                            } else {
-                                //  call idct.
-                                (self.idct_func)(tmp, idct_pos, component.width_stride);
+                            let crop_y0 = self.crop_y.saturating_sub(16);
+                            let crop_y1 = (self.crop_y + self.crop_height).saturating_add(16);
+                            let crop_x0 = self.crop_x.saturating_sub(16);
+                            let crop_x1 = (self.crop_x + self.crop_width).saturating_add(16);
+
+                            let intersects = !self.use_cropping || (
+                                x_start < crop_x1 && x_end > crop_x0 &&
+                                y_start < crop_y1 && y_end > crop_y0
+                            );
+
+                            if intersects {
+                                let idct_position = if PROGRESSIVE {
+                                    // For non-interleaved, j indexes data units directly
+                                    j * 8
+                                } else {
+                                    // derived from stb and rewritten for my tastes
+                                    let c2 = v_samp * 8;
+                                    let c3 = ((j * component.horizontal_sample) + h_samp) * 8;
+
+                                    component.width_stride * c2 + c3
+                                };
+
+                                let idct_pos = channel.get_mut(idct_position..).unwrap();
+                                if len <= 1 || self.downscale_factor >= 8 {
+                                    (self.idct_1x1_func)(tmp, idct_pos, component.width_stride);
+                                } else if len <= 10 || self.downscale_factor >= 4 {
+                                    (self.idct_4x4_func)(tmp, idct_pos, component.width_stride);
+                                } else {
+                                    //  call idct.
+                                    (self.idct_func)(tmp, idct_pos, component.width_stride);
+                                }
                             }
                         }
                     }
@@ -1017,21 +1043,16 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         if out_colorspace_components < comp_len && self.options.jpeg_get_out_colorspace() == Luma {
             comp_len = out_colorspace_components;
         }
-        let out_width = width / self.downscale_factor;
+        let out_width = if self.use_cropping { self.crop_width } else { width } / self.downscale_factor;
         let n = self.downscale_factor;
         let mut color_conv_function =
             |num_iters: usize, samples: [&[i16]; 4]| -> Result<(), DecodeErrors> {
-                let mut chunks = pixels[px..].chunks_exact_mut(out_width * out_colorspace_components);
-                for pos in 0..num_iters {
-                    let row_idx = self.next_original_row;
-                    self.next_original_row += 1;
-
-                    let is_row_grid = row_idx % n == 0;
-                    if is_row_grid {
-                        let Some(output) = chunks.next() else {
-                            break;
-                        };
-                        if n == 1 {
+                if self.use_cropping {
+                    for pos in 0..num_iters {
+                        let row_idx = i * self.mcu_height + pos;
+                        let row_crop_idx = row_idx.saturating_sub(self.crop_y);
+                        let is_row_grid = row_crop_idx % n == 0;
+                        if is_row_grid && row_idx >= self.crop_y && row_idx < self.crop_y + self.crop_height {
                             let mut raw_samples: [&[i16]; 4] = [&[], &[], &[], &[]];
                             for (j, samp) in raw_samples.iter_mut().enumerate().take(comp_len) {
                                 let temp = &samples[j].get(pos * padded_width..(pos + 1) * padded_width);
@@ -1040,25 +1061,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                                 }
                                 *samp = temp.unwrap();
                             }
-                            color_convert(
-                                &raw_samples,
-                                self.color_convert_16,
-                                self.input_colorspace,
-                                self.options.jpeg_get_out_colorspace(),
-                                output,
-                                width,
-                                padded_width,
-                            )?;
-                        } else {
                             let mut temp_row = vec![0u8; width * out_colorspace_components];
-                            let mut raw_samples: [&[i16]; 4] = [&[], &[], &[], &[]];
-                            for (j, samp) in raw_samples.iter_mut().enumerate().take(comp_len) {
-                                let temp = &samples[j].get(pos * padded_width..(pos + 1) * padded_width);
-                                if temp.is_none() {
-                                    return Err(DecodeErrors::FormatStatic("Missing samples"));
-                                }
-                                *samp = temp.unwrap();
-                            }
                             color_convert(
                                 &raw_samples,
                                 self.color_convert_16,
@@ -1068,14 +1071,93 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                                 width,
                                 padded_width,
                             )?;
-                            for c in 0..out_width {
-                                let src_idx = c * n * out_colorspace_components;
-                                let dst_idx = c * out_colorspace_components;
-                                output[dst_idx..dst_idx + out_colorspace_components]
-                                    .copy_from_slice(&temp_row[src_idx..src_idx + out_colorspace_components]);
+                            
+                            let row_out_idx = row_crop_idx / n;
+                            let dst_offset = row_out_idx * out_width * out_colorspace_components;
+                            
+                            if n == 1 {
+                                let src_offset = self.crop_x * out_colorspace_components;
+                                let copy_bytes = out_width * out_colorspace_components;
+                                if dst_offset + copy_bytes <= pixels.len() {
+                                    pixels[dst_offset..dst_offset + copy_bytes]
+                                        .copy_from_slice(&temp_row[src_offset..src_offset + copy_bytes]);
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                let copy_bytes = out_width * out_colorspace_components;
+                                if dst_offset + copy_bytes <= pixels.len() {
+                                    let output_chunk = &mut pixels[dst_offset..dst_offset + copy_bytes];
+                                    for c in 0..out_width {
+                                        let src_c = self.crop_x + c * n;
+                                        let src_idx = src_c * out_colorspace_components;
+                                        let dst_idx = c * out_colorspace_components;
+                                        output_chunk[dst_idx..dst_idx + out_colorspace_components]
+                                            .copy_from_slice(&temp_row[src_idx..src_idx + out_colorspace_components]);
+                                    }
+                                } else {
+                                    break;
+                                }
                             }
                         }
-                        px += out_width * out_colorspace_components;
+                    }
+                } else {
+                    let mut chunks = pixels[px..].chunks_exact_mut(out_width * out_colorspace_components);
+                    for pos in 0..num_iters {
+                        let row_idx = self.next_original_row;
+                        self.next_original_row += 1;
+
+                        let is_row_grid = row_idx % n == 0;
+                        if is_row_grid {
+                            let Some(output) = chunks.next() else {
+                                break;
+                            };
+                            if n == 1 {
+                                let mut raw_samples: [&[i16]; 4] = [&[], &[], &[], &[]];
+                                for (j, samp) in raw_samples.iter_mut().enumerate().take(comp_len) {
+                                    let temp = &samples[j].get(pos * padded_width..(pos + 1) * padded_width);
+                                    if temp.is_none() {
+                                        return Err(DecodeErrors::FormatStatic("Missing samples"));
+                                    }
+                                    *samp = temp.unwrap();
+                                }
+                                color_convert(
+                                    &raw_samples,
+                                    self.color_convert_16,
+                                    self.input_colorspace,
+                                    self.options.jpeg_get_out_colorspace(),
+                                    output,
+                                    width,
+                                    padded_width,
+                                )?;
+                            } else {
+                                let mut temp_row = vec![0u8; width * out_colorspace_components];
+                                let mut raw_samples: [&[i16]; 4] = [&[], &[], &[], &[]];
+                                for (j, samp) in raw_samples.iter_mut().enumerate().take(comp_len) {
+                                    let temp = &samples[j].get(pos * padded_width..(pos + 1) * padded_width);
+                                    if temp.is_none() {
+                                        return Err(DecodeErrors::FormatStatic("Missing samples"));
+                                    }
+                                    *samp = temp.unwrap();
+                                }
+                                color_convert(
+                                    &raw_samples,
+                                    self.color_convert_16,
+                                    self.input_colorspace,
+                                    self.options.jpeg_get_out_colorspace(),
+                                    &mut temp_row,
+                                    width,
+                                    padded_width,
+                                )?;
+                                for c in 0..out_width {
+                                    let src_idx = c * n * out_colorspace_components;
+                                    let dst_idx = c * out_colorspace_components;
+                                    output[dst_idx..dst_idx + out_colorspace_components]
+                                        .copy_from_slice(&temp_row[src_idx..src_idx + out_colorspace_components]);
+                                }
+                            }
+                            px += out_width * out_colorspace_components;
+                        }
                     }
                 }
                 Ok(())

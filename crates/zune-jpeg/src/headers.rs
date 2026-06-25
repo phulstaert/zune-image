@@ -358,8 +358,8 @@ pub(crate) fn parse_start_of_frame<T: ZByteReaderTrait>(
             return Err(DecodeErrors::Format(format!("Image height {} greater than height limit {}. If use `set_limits` if you want to support huge images", img_height, img.options.max_height())));
         }
 
-        // Check image width or height is zero
-        if img_width == 0 || img_height == 0 {
+        // Check image width is zero
+        if img_width == 0 {
             return Err(DecodeErrors::ZeroError);
         }
 

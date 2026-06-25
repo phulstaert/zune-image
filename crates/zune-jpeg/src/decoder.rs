@@ -293,6 +293,11 @@ pub struct JpegDecoder<T> {
     /// Number of output bytes known to be stable after the most recent
     /// `decode_into` attempt.
     pub(crate) pixels_decoded: usize,
+    pub(crate) crop_x:           usize,
+    pub(crate) crop_y:           usize,
+    pub(crate) crop_width:       usize,
+    pub(crate) crop_height:      usize,
+    pub(crate) use_cropping:     bool,
     pub(crate) downscale_factor: usize,
     pub(crate) next_original_row: usize,
     /// Persistent coefficient buffers for multi-SOS baseline decoding.
@@ -558,6 +563,11 @@ where
             header_resume_position: 0,
             scan_state: None,
             pixels_decoded: 0,
+            crop_x:            0,
+            crop_y:            0,
+            crop_width:        0,
+            crop_height:       0,
+            use_cropping:      false,
             downscale_factor: 1,
             next_original_row: 0,
             mcu_checkpoints_enabled: false,
@@ -623,19 +633,32 @@ where
         return Some(self.info.clone());
     }
 
+    /// Set the cropping region for ROI (Region of Interest) decoding.
+    ///
+    /// This allows skipping IDCT and color conversion outside this region.
+    pub fn set_cropping_region(&mut self, x: usize, y: usize, w: usize, h: usize) {
+        self.crop_x = x;
+        self.crop_y = y;
+        self.crop_width = w;
+        self.crop_height = h;
+        self.use_cropping = true;
+    }
+
     /// Set the downscaling factor (1, 2, 4, or 8).
     pub fn set_downscale_factor(&mut self, factor: usize) {
         self.downscale_factor = factor;
     }
 
-    /// Return the output width of the image taking downscaling into account.
+    /// Return the output width of the image taking downscaling and cropping into account.
     pub fn output_width(&self) -> usize {
-        usize::from(self.info.width) / self.downscale_factor
+        let w = if self.use_cropping { self.crop_width } else { usize::from(self.info.width) };
+        w / self.downscale_factor
     }
 
-    /// Return the output height of the image taking downscaling into account.
+    /// Return the output height of the image taking downscaling and cropping into account.
     pub fn output_height(&self) -> usize {
-        usize::from(self.info.height) / self.downscale_factor
+        let h = if self.use_cropping { self.crop_height } else { usize::from(self.info.height) };
+        h / self.downscale_factor
     }
 
     /// Return the number of bytes required to hold a decoded image frame
@@ -1100,10 +1123,7 @@ where
             }
 
             Marker::DNL => {
-                return Err(DecodeErrors::Format(format!(
-                    "Parsing of the following header `{m:?}` is not supported,\
-                                cannot continue"
-                )));
+                with_marker_body(self, |_decoder, _body| Ok(()))?;
             }
             Marker::DRI => {
                 with_marker_body(self, |decoder, body| {
@@ -1525,6 +1545,31 @@ where
     /// are available.
     pub fn decode_headers(&mut self) -> Result<(), DecodeErrors> {
         self.decode_headers_internal()?;
+
+        if self.info.height == 0 {
+            let saved_pos = self.stream.position()? as usize;
+            let mut dnl_height = None;
+            let mut last_byte = 0;
+
+            while let Ok(byte) = self.stream.read_u8_err() {
+                if last_byte == 0xFF && byte == 0xDC {
+                    let _len = self.stream.get_u16_be_err()?;
+                    let height = self.stream.get_u16_be_err()?;
+                    dnl_height = Some(height);
+                    break;
+                }
+                last_byte = byte;
+            }
+
+            self.stream.set_position(saved_pos)?;
+
+            if let Some(height) = dnl_height {
+                self.info.height = height;
+            } else {
+                return Err(DecodeErrors::FormatStatic("Missing DNL marker for image with height 0"));
+            }
+        }
+
         Ok(())
     }
 
