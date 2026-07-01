@@ -409,6 +409,12 @@ pub(crate) fn parse_start_of_frame<T: ZByteReaderTrait>(
         img.info.set_density(dt_precision);
         img.info.set_height(img_height);
         img.info.set_width(img_width);
+        // A height of 0 means the encoder used a DNL marker to define the
+        // actual line count. Signal this so the MCU decode loop knows to
+        // intercept the DNL marker rather than stopping at row 0.
+        if img_height == 0 {
+            img.expects_dnl = true;
+        }
         if num_components == 1 {
             img.input_colorspace = ColorSpace::Luma;
             debug!("Overriding default colorspace set to Luma");
